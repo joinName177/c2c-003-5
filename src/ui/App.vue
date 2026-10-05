@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { computed, reactive, ref } from 'vue';
 import { LocalRecipeRepository } from '../adapters/local-recipe.repository';
-import { NUTRITION, NUTRITION_META, SOURCES, type NutritionType, type SourceType } from '../core/models';
+import { BrowserNotificationAdapter } from '../adapters/browser-notification.adapter';
+import { NUTRITION, NUTRITION_META, SOURCES, type ReminderPrefs, type NutritionType, type SourceType } from '../core/models';
 import { createEntry, diagnoses, mealScore, metricsFor, sampleSnapshot } from '../core/recipe-engine';
+import { reconcilePrefsAfterLog } from '../core/reminder';
+import { useReminder } from './useReminder';
 
 const repo = new LocalRecipeRepository();
 const state = reactive(repo.load());
@@ -14,14 +17,50 @@ const score = computed(() => mealScore(metrics.value));
 const findings = computed(() => diagnoses(metrics.value));
 const recent = computed(() => [...state.entries].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 7));
 const totalMinutes = computed(() => state.entries.reduce((sum, item) => sum + item.minutes, 0));
-function save() { repo.save({ entries: state.entries, dailyGoal: state.dailyGoal }); }
-function addEntry() { state.entries.unshift(createEntry(draft.title, draft.source, draft.nutrition, draft.minutes, draft.note)); save(); draft.title = ''; draft.note = ''; notice.value = '摄入已记录，餐盘已重新计算'; tab.value = '餐盘'; }
+const todayMinutes = computed(() => { const key = localToday(); return state.entries.filter((item) => item.date === key).reduce((sum, item) => sum + item.minutes, 0); });
+const reminderPrefs = computed<ReminderPrefs>({
+  get: () => state.reminders ?? {},
+  set: (value) => { state.reminders = value; save(); },
+});
+const notifier = new BrowserNotificationAdapter();
+const notificationHint = ref('');
+const { status: reminder, notificationSupported, notificationPermission, enableBrowserNotifications, disableBrowserNotifications, dismissToday } = useReminder(
+  computed(() => state.entries),
+  computed(() => state.dailyGoal),
+  reminderPrefs,
+  notifier,
+  (next) => { state.reminders = next; save(); },
+);
+function localToday(): string { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }
+function save() { repo.save({ entries: state.entries, dailyGoal: state.dailyGoal, reminders: state.reminders }); }
+function addEntry() {
+  state.entries.unshift(createEntry(draft.title, draft.source, draft.nutrition, draft.minutes, draft.note));
+  // 记录一次摄入后立即按最新完成度重算提醒状态（达标则清除当日关闭/通知标记）
+  state.reminders = reconcilePrefsAfterLog(state.reminders, state.entries, state.dailyGoal);
+  save();
+  draft.title = ''; draft.note = ''; notice.value = '摄入已记录，餐盘与提醒已重新计算'; tab.value = '餐盘';
+}
 function removeEntry(id: string) { state.entries = state.entries.filter((item) => item.id !== id); save(); }
-function reset() { const fresh = sampleSnapshot(); state.entries = fresh.entries; state.dailyGoal = fresh.dailyGoal; save(); notice.value = '已恢复初始示例餐盘'; }
+function reset() { const fresh = sampleSnapshot(); state.entries = fresh.entries; state.dailyGoal = fresh.dailyGoal; state.reminders = {}; save(); notice.value = '已恢复初始示例餐盘'; }
+function closeReminder() { dismissToday(); }
+async function toggleBrowserNotification() {
+  notificationHint.value = '';
+  if (state.reminders?.browserEnabled) { disableBrowserNotifications(); notificationHint.value = '已关闭浏览器通知，顶部提醒仍会保留'; return; }
+  const result = await enableBrowserNotifications();
+  notificationHint.value = result === 'granted' ? '已开启：摄入不足时每个时段最多通知一次' : result === 'unsupported' ? '当前浏览器不支持通知' : '通知权限被拒绝，已保留顶部提醒';
+}
+const notificationToggleText = computed(() => {
+  if (!notificationSupported) return '通知不可用';
+  if (state.reminders?.browserEnabled && notificationPermission() === 'granted') return '浏览器通知 ✓';
+  return '开启浏览器通知';
+});
 </script>
 
 <template>
-  <div class="recipe-app"><header class="recipe-topbar"><div class="recipe-brand"><span class="recipe-mark">食</span><div><span class="eyebrow">ATTENTION KITCHEN / 03</span><h1>信息食谱调配师</h1></div></div><div class="recipe-actions"><span>今日已摄入 <b>{{ totalMinutes }}</b> min</span><button type="button" @click="reset">重置演示</button></div></header><main class="recipe-wrap"><section class="recipe-hero"><div><span class="eyebrow coral-text">YOUR DAILY INFORMATION DIET</span><h2>今天，给大脑<br /><em>配一份好食谱。</em></h2><p>信息也有营养密度。记录、咀嚼，再决定下一口要吃什么。</p></div><div class="daily-goal"><span>每日建议摄入</span><strong>{{ state.dailyGoal }}<small>min</small></strong><div><i :style="{ width: `${Math.min(100, totalMinutes / state.dailyGoal * 100)}%` }"></i></div><small>{{ Math.round(totalMinutes / state.dailyGoal * 100) }}% 完成</small></div></section><nav class="recipe-tabs"><button v-for="item in ['餐盘', '摄入', '检测', '方案', '报告']" :key="item" type="button" :class="{ active: tab === item }" @click="tab = item as typeof tab">{{ item }}</button></nav>
+  <div class="recipe-app"><header class="recipe-topbar"><div class="recipe-brand"><span class="recipe-mark">食</span><div><span class="eyebrow">ATTENTION KITCHEN / 03</span><h1>信息食谱调配师</h1></div></div><div class="recipe-actions"><span>今日已摄入 <b>{{ todayMinutes }}</b> min</span><button type="button" :disabled="!notificationSupported" :title="notificationHint" @click="toggleBrowserNotification">{{ notificationToggleText }}</button><button type="button" @click="reset">重置演示</button></div></header>
+    <div v-if="reminder.due" class="reminder-bar" role="alert"><span class="reminder-bell">♨</span><div class="reminder-text"><strong>{{ reminder.phase?.label }}摄入提醒</strong><p>{{ reminder.message }}</p></div><button type="button" class="reminder-log" @click="tab = '摄入'">去记录 →</button><button type="button" class="reminder-close" title="今天不再提醒" @click="closeReminder">×</button></div>
+    <p v-if="notificationHint" class="notification-hint">{{ notificationHint }}</p>
+<main class="recipe-wrap"><section class="recipe-hero"><div><span class="eyebrow coral-text">YOUR DAILY INFORMATION DIET</span><h2>今天，给大脑<br /><em>配一份好食谱。</em></h2><p>信息也有营养密度。记录、咀嚼，再决定下一口要吃什么。</p></div><div class="daily-goal"><span>每日建议摄入</span><strong>{{ state.dailyGoal }}<small>min</small></strong><div><i :style="{ width: `${Math.min(100, todayMinutes / state.dailyGoal * 100)}%` }"></i></div><small>{{ Math.min(100, Math.round(todayMinutes / state.dailyGoal * 100)) }}% 完成</small></div></section><nav class="recipe-tabs"><button v-for="item in ['餐盘', '摄入', '检测', '方案', '报告']" :key="item" type="button" :class="{ active: tab === item }" @click="tab = item as typeof tab">{{ item }}</button></nav>
       <section v-if="tab === '餐盘'" class="plate-layout"><article class="plate-panel"><div class="section-heading"><div><span class="eyebrow">TODAY'S PLATE</span><h3>今日信息餐盘</h3></div><span class="score-chip">营养均衡度 {{ score }}</span></div><div class="pyramid"><div class="pyramid-level level-1"><span>深度知识</span><b>{{ Math.round((metrics[0]?.share || 0) * 100) }}%</b></div><div class="pyramid-level level-2"><span>行业动态</span><span>技能提升</span></div><div class="pyramid-level level-3"><span>娱乐消遣</span><span>社交信息</span></div></div><div class="pyramid-note"><span>信息营养金字塔</span><p>底层是每天应该稳定摄入的深度内容，上层是有意识调味的轻内容。</p></div></article><aside class="plate-side"><div class="side-card"><span class="eyebrow">NUTRIENT SNAPSHOT</span><h4>营养快照</h4><div v-for="item in metrics" :key="item.nutrition" class="nutrient-row"><div><i :style="{ background: item.color }"></i><span>{{ item.nutrition }}</span></div><strong>{{ item.minutes }}<small>min</small></strong></div></div><div class="side-card insight-card"><span class="eyebrow">KITCHEN NOTE</span><p>“{{ findings[0] }}”</p><button type="button" @click="tab = '检测'">查看完整检测 →</button></div></aside></section>
       <section v-else-if="tab === '摄入'" class="intake-layout"><article class="intake-form"><div class="section-heading"><div><span class="eyebrow">ADD TO THE PLATE</span><h3>记录一次信息摄入</h3></div><span class="section-number">01 / 05</span></div><label>内容标题<input v-model="draft.title" placeholder="例如：一篇关于城市设计的文章" /></label><label>内容形式<select v-model="draft.source"><option v-for="source in SOURCES" :key="source" :value="source">{{ source }}</option></select></label><label>营养类别<select v-model="draft.nutrition"><option v-for="nutrition in NUTRITION" :key="nutrition" :value="nutrition">{{ nutrition }} · {{ NUTRITION_META[nutrition].hint }}</option></select></label><label>消费时长 <output>{{ draft.minutes }} 分钟</output><input v-model.number="draft.minutes" type="range" min="5" max="180" step="5" /></label><label>备注（可选）<textarea v-model="draft.note" rows="3" placeholder="它给你带来了什么？"></textarea></label><button class="coral-button" type="button" @click="addEntry">加入今日餐盘 →</button><p class="notice">{{ notice }}</p></article><article class="intake-list"><div class="section-heading"><div><span class="eyebrow">RECENT BITES</span><h3>最近摄入</h3></div><span class="section-number">{{ state.entries.length }} 条</span></div><div class="bite-list"><div v-for="item in recent" :key="item.id" class="bite-row"><div class="bite-icon" :style="{ background: NUTRITION_META[item.nutrition].color }">{{ NUTRITION_META[item.nutrition].icon }}</div><div><strong>{{ item.title }}</strong><span>{{ item.source }} · {{ item.nutrition }} · {{ item.date }}</span></div><b>{{ item.minutes }}′</b><button type="button" title="删除记录" @click="removeEntry(item.id)">×</button></div></div></article></section>
       <section v-else-if="tab === '检测'" class="diagnosis-layout"><article class="diagnosis-main"><div class="section-heading"><div><span class="eyebrow">DIET DIAGNOSIS</span><h3>你的信息偏食检测</h3></div><span class="score-chip">{{ score }} / 100</span></div><div class="diagnosis-list"><div v-for="(item, index) in findings" :key="item" class="diagnosis-item"><span>0{{ index + 1 }}</span><div><strong>{{ item.includes('偏高') ? '摄入偏高' : item.includes('偏少') ? '长期缺失' : '整体平衡' }}</strong><p>{{ item }}</p></div><i>{{ item.includes('整体') ? '✓' : '!' }}</i></div></div></article><aside class="radar-card"><span class="eyebrow">BALANCE RADAR</span><h4>营养平衡雷达</h4><div class="radar-bars"><div v-for="item in metrics" :key="item.nutrition"><span>{{ item.nutrition }}</span><div><i :style="{ width: `${Math.min(100, item.share / item.target * 100)}%`, background: item.color }"></i></div><small>{{ Math.round(item.share * 100) }}%</small></div></div></aside></section>

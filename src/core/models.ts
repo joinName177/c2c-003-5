@@ -1,7 +1,9 @@
 export type SourceType = '文章' | '视频' | '播客' | '社交媒体' | '书籍';
 export type NutritionType = '深度知识' | '行业动态' | '技能提升' | '娱乐消遣' | '社交信息';
-export interface InfoEntry { id: string; title: string; source: SourceType; nutrition: NutritionType; minutes: number; date: string; note: string; }
-export interface RecipeSnapshot { entries: InfoEntry[]; dailyGoal: number; }
+export interface InfoEntry { id: string; title: string; source: SourceType; nutrition: NutritionType; minutes: number; date: string; note: string; createdAt?: string; }
+export interface RecipeSnapshot { entries: InfoEntry[]; dailyGoal: number; reminders?: ReminderPrefs; }
+/** 摄入提醒偏好；dismissedOn 为用户手动关闭提醒的本地日期（YYYY-MM-DD），跨天自动失效 */
+export interface ReminderPrefs { browserEnabled?: boolean; dismissedOn?: string; notifiedWindows?: string[]; }
 export interface NutritionMetric { nutrition: NutritionType; minutes: number; share: number; target: number; color: string; icon: string; }
 export const SOURCES: SourceType[] = ['文章', '视频', '播客', '社交媒体', '书籍'];
 export const NUTRITION: NutritionType[] = ['深度知识', '行业动态', '技能提升', '娱乐消遣', '社交信息'];
